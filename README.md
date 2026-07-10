@@ -8,9 +8,9 @@ No framework, no build step, no external requests. The frontend is one `index.ht
 `file://`); the backend is one stdlib Python file that reads `nvidia-smi` and each server's
 Prometheus `/metrics`.
 
-> Dark green terminal aesthetic: a left nav, a GPU grid (per-card util/VRAM/power/temp/tenants),
-> a live throughput panel (decode & prefill tok/s), context/KV fill, system + network stats, and a
-> browsable model library. Add your own screenshot here once you've run it.
+![LLM Serve Dashboard](docs/screenshot.png)
+
+*(Screenshot rendered with example data — plug in your own box and it goes live.)*
 
 ## What it shows
 

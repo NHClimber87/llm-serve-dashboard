@@ -1206,7 +1206,7 @@ function updateMetrics(data) {
   const decodeTotal = met['llamacpp:tokens_predicted_total'] || met['vllm:generation_tokens_total'] || 0;
   const reqs = der.requests_processing || met['llamacpp:requests_processing'] || 0;
 
-  // surface seat concurrency on the model tile (operator 2026-07-08: "is it single stream?")
+  // surface seat concurrency on the model tile
   const msub = document.getElementById('metric-model-sub');
   if (msub && props.n_ctx) msub.textContent += ' · ' + reqs + ' active seat' + (reqs === 1 ? '' : 's');
 
@@ -1456,7 +1456,7 @@ function renderThoughts(data) {
   if (!streams.length) {
     const flat = data.thoughts && data.thoughts.text ? data.thoughts.text.trim() : '';
     container.innerHTML = '<div class="card" style="border-color:rgba(168,85,247,0.35);"><div class="metric-sub" style="color:var(--ink-dim);">'
-      + (flat ? 'tap connected — waiting for the next thought.' : 'tap idle — no concurrent thinkers captured yet. Re-point a caller at :8090.')
+      + (flat ? 'tap connected — waiting for the next thought.' : 'tap idle — no reasoning streams captured yet (optional feature; set THOUGHT_LOG).')
       + '</div></div>';
     if (summary) { summary.textContent = 'idle'; summary.style.color = 'var(--ink-dim)'; }
     return;
@@ -1549,7 +1549,7 @@ async function renderLibrary() {
       const el = document.createElement('div');
       el.className = 'metric-card';
       const role = (m.role || '').split(' ')[0];
-      const badge = role === 'RESIDENT' ? 'var(--emerald, #24F094)' : role === 'EXTERNAL' ? '#fbbf24' : 'var(--ink-dim)';
+      const badge = role === 'PRIMARY' ? 'var(--emerald, #24F094)' : role === 'SECONDARY' ? '#fbbf24' : 'var(--ink-dim)';
       const row = (k, v) => v ? `<div class="metric-sub" style="margin-top:3px;"><span style="color:var(--ink-dim);">${k}</span> ${v}</div>` : '';
       el.innerHTML =
         `<div style="display:flex;justify-content:space-between;align-items:baseline;">

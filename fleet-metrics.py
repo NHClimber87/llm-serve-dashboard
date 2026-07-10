@@ -21,12 +21,12 @@ COMFYUI_URL = "http://localhost:8188/"
 # Discover candidates DYNAMICALLY from listening sockets each resolution: :8001 first, then any
 # listener in the serving range, probed for llama.cpp /props OR vLLM /v1/models. Excludes the
 # 909x/809x bands and known non-server sidecars (a small CPU autocomplete on :8081 was otherwise
-# picked as "the resident" while the real one sat on another port).
+# picked as the primary while the real server sat on another port).
 # Override the candidate list with WORKER_PORT_CANDIDATES=8001,8010 in the environment.
 WORKER_PORT_CANDIDATES = [int(p) for p in os.environ.get(
     "WORKER_PORT_CANDIDATES", "8001,8010,8123").split(",") if p.strip()]
 WORKER_EXCLUDE_PORTS = {
-    8081,  # small CPU autocomplete sidecar — never the resident
+    8081,  # small CPU autocomplete sidecar — never the primary server
     8188,  # ComfyUI (image gen)
 }
 
@@ -44,8 +44,8 @@ def _listening_ports():
 
 def resolve_worker_port():
     """The :8001 default wins when up; otherwise the responder with the LARGEST per-slot ctx.
-    Hard rule: the resident serves >=96K/slot, so any tiny-ctx utility server that slips
-    past the exclusion list still loses to the real resident."""
+    A large-context server usually wins, so a tiny-ctx utility server that slips past the
+    exclusion list still loses to the real primary server."""
     seen = _listening_ports()
     candidates = [8001] + [p for p in (seen or WORKER_PORT_CANDIDATES) if p != 8001]
     best = None  # (n_ctx, port)
@@ -252,9 +252,8 @@ def fetch_vllm_props(port):
 # Per-port counter history for vLLM rate derivation: {port: [(t, prompt_total, gen_total), ...]}
 _VLLM_HIST = {}
 _DECODE_WINDOW_S = 3.0    # short window so brief decode bursts read true (was 6.0; a 300-tok MTP
-                          # generation is a ~4-5s burst that 6s smearing under-read to ~23 t/s, 2026-07-09)
-# Prompt throughput = BURST-HOLD (operator 2026-07-08: "catch what is being thrown and hold it
-# until it gets another — 0 is not a valid answer"). Prefill happens in ~1s bursts; we compute
+                          # generation is a ~4-5s burst that 6s smearing under-read to ~23 t/s)
+# Prompt throughput = BURST-HOLD. Prefill happens in ~1s bursts; we compute
 # the TRUE rate of the latest burst from vLLM's cumulative pair Δprefill_tokens/Δprefill_time
 # and HOLD it between bursts. Seeded with the lifetime ratio so it's never 0 after first prefill.
 # {port: (last_pf_tok, last_pf_time, held_rate)}
@@ -631,7 +630,7 @@ class Handler(BaseHTTPRequestHandler):
             return []
 
     def _gather(self):
-        # Card 1 worker — keep the legacy llama_8001 shape, now also carrying
+        # Primary worker — keep the llama_8001 key shape, now also carrying
         # loras + derived fields so the worker panel can show ctx-fill / LoRAs too.
         worker_port = resolve_worker_port()
         worker = fetch_endpoint(worker_port)
