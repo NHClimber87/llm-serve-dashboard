@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+*.log
+.DS_Store
+# keep your real registry / secrets out of the repo
+models-registry.local.json
+.env

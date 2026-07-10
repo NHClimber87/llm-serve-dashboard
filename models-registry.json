@@ -1,0 +1,40 @@
+{
+  "_doc": "Example loadable-model registry for the dashboard's Model Library. Point fleet-metrics.py at your own with MODELS_REGISTRY=/path/to/file.json (or edit this file). Numbers are illustrative; null = unbenched. tg/pp = tokens/sec decode/prefill.",
+  "asof": "2026-01-01",
+  "models": [
+    {
+      "id": "example-8b",
+      "name": "Example-8B-Instruct",
+      "role": "general chat",
+      "engine": "llama.cpp",
+      "port": 8001,
+      "launcher": "llama-server -m example-8b-Q4_K_M.gguf -c 131072 -ngl 99",
+      "quant": "Q4_K_M",
+      "disk_gb": 4.9,
+      "ctx": 131072,
+      "tg": 85,
+      "pp": 1900,
+      "kv": "f16",
+      "mtp": false,
+      "extras": "single 24GB GPU",
+      "src": "example, your-bench-date"
+    },
+    {
+      "id": "example-moe-30b",
+      "name": "Example-MoE-30B-A3B",
+      "role": "coding / agentic",
+      "engine": "vLLM",
+      "port": 8010,
+      "launcher": "vllm serve example-moe-30b --max-model-len 131072 -tp 2",
+      "quant": "INT8",
+      "disk_gb": 31.0,
+      "ctx": 131072,
+      "tg": 37,
+      "pp": 2200,
+      "kv": "fp8",
+      "mtp": true,
+      "extras": "2x GPU tensor-parallel",
+      "src": null
+    }
+  ]
+}
