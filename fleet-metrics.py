@@ -141,12 +141,11 @@ def _resolve_process_name(pid, raw_name):
             pass
     return name
 
+def _query_gpu_compute_apps():
+    """Query nvidia-smi for GPU UUIDs and compute apps.
 
-def attach_gpu_procs(gpus):
-    """Annotate each GPU dict with its actual compute tenants (name + VRAM), so the
-    dashboard labels cards from ground truth instead of VRAM-threshold guessing."""
-    if not isinstance(gpus, list):  # parse_nvidia_smi error path returns ([], err)
-        return gpus
+    Returns (uuid_to_idx_dict, app_output_string) or None on any error.
+    """
     try:
         uuid_out = subprocess.check_output(
             ["nvidia-smi", "--query-gpu=index,uuid", "--format=csv,noheader"],
@@ -159,8 +158,20 @@ def attach_gpu_procs(gpus):
         app_out = subprocess.check_output(
             ["nvidia-smi", "--query-compute-apps=gpu_uuid,pid,process_name,used_memory",
              "--format=csv,noheader,nounits"], text=True, timeout=5).strip()
+        return uuid_to_idx, app_out
     except Exception:
+        return None
+
+
+def attach_gpu_procs(gpus):
+    """Annotate each GPU dict with its actual compute tenants (name + VRAM), so the
+    dashboard labels cards from ground truth instead of VRAM-threshold guessing."""
+    if not isinstance(gpus, list):  # parse_nvidia_smi error path returns ([], err)
         return gpus
+    data = _query_gpu_compute_apps()
+    if data is None:
+        return gpus
+    uuid_to_idx, app_out = data
     procs_by_idx = {}
     for line in app_out.split("\n"):
         parts = [p.strip() for p in line.split(",")]
