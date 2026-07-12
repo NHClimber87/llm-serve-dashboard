@@ -604,6 +604,14 @@ def _service_ports(lport, pport):
     return {int(prt) for prt in (lport, pport) if prt.isdigit() and int(prt) < 30000}
 
 
+def _update_lan_peer(ip, names, lan_peers, lport, pport):
+    """Add or update a LAN peer entry in the lan_peers dict."""
+    e = lan_peers.setdefault(ip, {"ip": ip, "name": names.get(ip, ""),
+                                   "conns": 0, "ports": set()})
+    e["conns"] += 1
+    e["ports"].update(_service_ports(lport, pport))
+
+
 def _parse_tcp_peers(names):
     """Parse `ss -Htn state established` into LAN peers and WAN connection count.
 
@@ -624,10 +632,7 @@ def _parse_tcp_peers(names):
             if pip.startswith("127.") or pip.startswith("[") or pip == "":
                 continue
             if any(pip.startswith(p) for p in _PRIVATE_PREFIXES):
-                e = lan_peers.setdefault(pip, {"ip": pip, "name": names.get(pip, ""),
-                                               "conns": 0, "ports": set()})
-                e["conns"] += 1
-                e["ports"].update(_service_ports(lport, pport))
+                _update_lan_peer(pip, names, lan_peers, lport, pport)
             else:
                 wan_conns += 1
     except Exception:
