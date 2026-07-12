@@ -129,6 +129,19 @@ def parse_nvidia_smi():
     return gpus
 
 
+def _resolve_process_name(pid, raw_name):
+    """Return a meaningful process name. If *raw_name* starts with 'python',
+    read /proc/PID/cmdline to find the actual .py script."""
+    name = os.path.basename(raw_name)
+    if name.startswith("python"):
+        try:
+            argv = open(f"/proc/{pid}/cmdline", "rb").read().decode().split("\0")
+            name = next((os.path.basename(a) for a in argv if a.endswith(".py")), name)
+        except Exception:
+            pass
+    return name
+
+
 def attach_gpu_procs(gpus):
     """Annotate each GPU dict with its actual compute tenants (name + VRAM), so the
     dashboard labels cards from ground truth instead of VRAM-threshold guessing."""
@@ -154,14 +167,7 @@ def attach_gpu_procs(gpus):
         if len(parts) < 4 or parts[0] not in uuid_to_idx:
             continue
         idx = uuid_to_idx[parts[0]]
-        name = os.path.basename(parts[2])
-        if name.startswith("python"):
-            # a bare "python" tenant is useless — pull the script name from the cmdline
-            try:
-                argv = open(f"/proc/{parts[1]}/cmdline", "rb").read().decode().split("\0")
-                name = next((os.path.basename(a) for a in argv if a.endswith(".py")), name)
-            except Exception:
-                pass
+        name = _resolve_process_name(parts[1], parts[2])
         try:
             mem = int(parts[3])
         except ValueError:
