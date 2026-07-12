@@ -50,6 +50,14 @@ def _fetch_server_props(port):
     return props
 
 
+def _port_nctx(port):
+    """Return n_ctx for a valid server on *port*, or None if unreachable/wrong format."""
+    props = _fetch_server_props(port)
+    if isinstance(props, dict) and "_error" not in props:
+        return props.get("n_ctx", 0) or 0
+    return None
+
+
 def resolve_worker_port():
     """The :8001 default wins when up; otherwise the responder with the LARGEST per-slot ctx.
     A large-context server usually wins, so a tiny-ctx utility server that slips past the
@@ -58,13 +66,11 @@ def resolve_worker_port():
     candidates = [8001] + [p for p in (seen or WORKER_PORT_CANDIDATES) if p != 8001]
     best = None  # (n_ctx, port)
     for p in candidates:
-        props = _fetch_server_props(p)
-        if isinstance(props, dict) and "_error" not in props:
-            if p == 8001:
-                return p
-            n_ctx = props.get("n_ctx", 0) or 0
-            if best is None or n_ctx > best[0]:
-                best = (n_ctx, p)
+        if p == 8001 and _port_nctx(p) is not None:
+            return p  # :8001 wins immediately when alive
+        nctx = _port_nctx(p)
+        if nctx is not None and (best is None or nctx > best[0]):
+            best = (nctx, p)
     return best[1] if best else 8001  # nothing up → report the default port as down
 
 # Secondary CPU-only llama-servers (optional). Each raw llama-server exposes the prometheus
