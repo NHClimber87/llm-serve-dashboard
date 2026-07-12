@@ -171,6 +171,24 @@ def _query_gpu_compute_apps():
         return None
 
 
+def _parse_compute_apps(app_out, uuid_to_idx):
+    """Parse nvidia-smi compute-apps CSV into a dict of GPU index → process list.
+
+    Returns {gpu_index: [{"name", "pid", "mem_mib"}, ...]}.
+    """
+    procs = {}
+    for line in app_out.split("\n"):
+        parts = [p.strip() for p in line.split(",")]
+        if len(parts) < 4 or parts[0] not in uuid_to_idx:
+            continue
+        idx = uuid_to_idx[parts[0]]
+        name = _resolve_process_name(parts[1], parts[2])
+        procs.setdefault(idx, []).append({
+            "name": name, "pid": int(parts[1]), "mem_mib": _safe_int(parts[3])
+        })
+    return procs
+
+
 def attach_gpu_procs(gpus):
     """Annotate each GPU dict with its actual compute tenants (name + VRAM), so the
     dashboard labels cards from ground truth instead of VRAM-threshold guessing."""
@@ -180,16 +198,7 @@ def attach_gpu_procs(gpus):
     if data is None:
         return gpus
     uuid_to_idx, app_out = data
-    procs_by_idx = {}
-    for line in app_out.split("\n"):
-        parts = [p.strip() for p in line.split(",")]
-        if len(parts) < 4 or parts[0] not in uuid_to_idx:
-            continue
-        idx = uuid_to_idx[parts[0]]
-        name = _resolve_process_name(parts[1], parts[2])
-        procs_by_idx.setdefault(idx, []).append({
-            "name": name, "pid": int(parts[1]), "mem_mib": _safe_int(parts[3])
-        })
+    procs_by_idx = _parse_compute_apps(app_out, uuid_to_idx)
     for g in gpus:
         plist = procs_by_idx.get(g["index"], [])
         g["procs"] = plist
