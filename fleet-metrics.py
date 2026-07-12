@@ -582,6 +582,11 @@ def _parse_arp_neighbors(names):
     return neighbors
 
 
+def _service_ports(lport, pport):
+    """Return service-side ports (low/registered, < 30000) from local and peer ports."""
+    return {int(prt) for prt in (lport, pport) if prt.isdigit() and int(prt) < 30000}
+
+
 def _parse_tcp_peers(names):
     """Parse `ss -Htn state established` into LAN peers and WAN connection count.
 
@@ -605,10 +610,7 @@ def _parse_tcp_peers(names):
                 e = lan_peers.setdefault(pip, {"ip": pip, "name": names.get(pip, ""),
                                                "conns": 0, "ports": set()})
                 e["conns"] += 1
-                # the service side of the socket is the low/registered port
-                for prt in (lport, pport):
-                    if prt.isdigit() and int(prt) < 30000:
-                        e["ports"].add(int(prt))
+                e["ports"].update(_service_ports(lport, pport))
             else:
                 wan_conns += 1
     except Exception:
