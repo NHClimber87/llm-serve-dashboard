@@ -129,6 +129,14 @@ def parse_nvidia_smi():
     return gpus
 
 
+def _safe_int(val, default=0):
+    """Parse an integer from a string, returning *default* on failure."""
+    try:
+        return int(val)
+    except (ValueError, TypeError):
+        return default
+
+
 def _resolve_process_name(pid, raw_name):
     """Return a meaningful process name. If *raw_name* starts with 'python',
     read /proc/PID/cmdline to find the actual .py script."""
@@ -179,11 +187,9 @@ def attach_gpu_procs(gpus):
             continue
         idx = uuid_to_idx[parts[0]]
         name = _resolve_process_name(parts[1], parts[2])
-        try:
-            mem = int(parts[3])
-        except ValueError:
-            mem = 0
-        procs_by_idx.setdefault(idx, []).append({"name": name, "pid": int(parts[1]), "mem_mib": mem})
+        procs_by_idx.setdefault(idx, []).append({
+            "name": name, "pid": int(parts[1]), "mem_mib": _safe_int(parts[3])
+        })
     for g in gpus:
         plist = procs_by_idx.get(g["index"], [])
         g["procs"] = plist
