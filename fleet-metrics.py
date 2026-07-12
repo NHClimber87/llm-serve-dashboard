@@ -42,6 +42,14 @@ def _listening_ports():
         return []
 
 
+def _fetch_server_props(port):
+    """Fetch server props from a port, trying llama.cpp /props first, then vLLM /v1/models."""
+    props = fetch_llama_props(port)
+    if not (isinstance(props, dict) and "_error" not in props):
+        props = fetch_vllm_props(port)
+    return props
+
+
 def resolve_worker_port():
     """The :8001 default wins when up; otherwise the responder with the LARGEST per-slot ctx.
     A large-context server usually wins, so a tiny-ctx utility server that slips past the
@@ -50,9 +58,7 @@ def resolve_worker_port():
     candidates = [8001] + [p for p in (seen or WORKER_PORT_CANDIDATES) if p != 8001]
     best = None  # (n_ctx, port)
     for p in candidates:
-        props = fetch_llama_props(p)
-        if not (isinstance(props, dict) and "_error" not in props):
-            props = fetch_vllm_props(p)
+        props = _fetch_server_props(p)
         if isinstance(props, dict) and "_error" not in props:
             if p == 8001:
                 return p
