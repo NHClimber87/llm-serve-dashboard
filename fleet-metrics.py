@@ -262,17 +262,12 @@ _VLLM_PP = {}
 _VLLM_SPEC = {}
 
 
-def fetch_vllm_endpoint(port):
-    """vLLM flavor of fetch_endpoint: same output shape, vllm: metric names.
+def _parse_vllm_metrics(metrics):
+    """Extract vLLM metric values from a parsed Prometheus dict.
 
-    vLLM exports cumulative counters (prompt_tokens_total / generation_tokens_total),
-    so PP/TG tok-s are derived from the delta since the previous poll (first
-    poll after a restart reads 0 — settles by the second sample).
+    Returns a dict with keys: kv_ratio, prompt_total, gen_total, running,
+    pf_tok, pf_time, spec_acc, spec_draft.
     """
-    metrics = fetch_llama_metrics(port)  # generic Prometheus parse works for vllm: names too
-    props = fetch_vllm_props(port)
-    up = "_error" not in props
-    n_ctx = props.get("n_ctx", 0) if up else 0
     kv_ratio = prompt_total = gen_total = running = 0.0
     pf_tok = pf_time = 0.0
     spec_acc = spec_draft = None   # spec-decode counters absent unless the server runs MTP/draft
@@ -294,6 +289,18 @@ def fetch_vllm_endpoint(port):
                 spec_acc = (spec_acc or 0.0) + v
             elif k.startswith("vllm:spec_decode_num_draft_tokens_total"):
                 spec_draft = (spec_draft or 0.0) + v
+    return {
+        "kv_ratio": kv_ratio, "prompt_total": prompt_total, "gen_total": gen_total,
+        "running": running, "pf_tok": pf_tok, "pf_time": pf_time,
+        "spec_acc": spec_acc, "spec_draft": spec_draft,
+    }
+
+
+def _update_vllm_history(port, prompt_total, gen_total, spec_acc, spec_draft):
+    """Update vLLM history for a port, handling restarts and memory bounds.
+
+    Returns the updated history list.
+    """
     now = time.time()
     hist = _VLLM_HIST.setdefault(port, [])
     # server restart resets counters -> drop stale history so rates don't go negative-then-zero
@@ -301,23 +308,35 @@ def fetch_vllm_endpoint(port):
         hist.clear()
     hist.append((now, prompt_total, gen_total, spec_acc or 0.0, spec_draft or 0.0))
     del hist[: max(0, len(hist) - 120)]   # bound memory (~4 min at 2s polls)
+    return hist, now
 
-    def _windowed_rate(idx, window):
-        ref = None
-        for s in hist:
-            if now - s[0] <= window:
-                break
-            ref = s
-        ref = ref or hist[0]
-        dt = now - ref[0]
-        if dt <= 0:
-            return 0.0
-        cur = (prompt_total, gen_total)[idx - 1]
-        return max(0.0, (cur - ref[idx]) / dt)
 
-    decode_tps = _windowed_rate(2, _DECODE_WINDOW_S)
+def _compute_windowed_rate(hist, now, prompt_total, gen_total, idx, window):
+    """Compute rate from history over a time window.
 
-    # prompt: burst-hold from the prefill-time histogram pair
+    idx=1 for prompt tokens, idx=2 for generation tokens.
+    Returns rate as tokens/second (floored at 0).
+    """
+    ref = None
+    for s in hist:
+        if now - s[0] <= window:
+            break
+        ref = s
+    ref = ref or hist[0]
+    dt = now - ref[0]
+    if dt <= 0:
+        return 0.0
+    cur = (prompt_total, gen_total)[idx - 1]
+    return max(0.0, (cur - ref[idx]) / dt)
+
+
+def _compute_prompt_tps(port, pf_tok, pf_time):
+    """Compute prompt tokens/second using burst-hold from prefill-time histogram pair.
+
+    Prefill happens in ~1s bursts; we compute the TRUE rate of the latest burst
+    from Δprefill_tokens/Δprefill_time and HOLD it between bursts.
+    Seeded with the lifetime ratio so it's never 0 after first prefill.
+    """
     lt, lp, held = _VLLM_PP.get(port, (None, None, 0.0))
     if lt is not None and (pf_tok < lt or pf_time < lp):
         lt = lp = None                                     # server restart -> counter reset
@@ -326,11 +345,16 @@ def fetch_vllm_endpoint(port):
     elif pf_tok > lt and pf_time > lp:
         held = (pf_tok - lt) / (pf_time - lp)              # rate of the latest burst
     _VLLM_PP[port] = (pf_tok, pf_time, held)
-    prompt_tps = held
+    return held
 
-    # MTP/spec-decode acceptance % — burst-hold like PP (decode bursts are short; 0 between
-    # generations is not a valid answer). Rate of the latest burst = Δaccepted/Δdrafted over
-    # the recent window; seeded with the lifetime ratio. None when the server runs no drafter.
+
+def _compute_spec_accept_pct(port, hist, now, spec_acc, spec_draft):
+    """Compute MTP/spec-decode acceptance % using burst-hold.
+
+    Decode bursts are short; 0 between generations is not a valid answer.
+    Rate of the latest burst = Δaccepted/Δdrafted over the recent window;
+    seeded with the lifetime ratio. None when the server runs no drafter.
+    """
     spec_accept_pct = None
     if spec_draft is not None and spec_draft > 0:
         ref = None
@@ -347,6 +371,44 @@ def fetch_vllm_endpoint(port):
             held_pct = 100.0 * (spec_acc or 0.0) / spec_draft   # seed: lifetime average
         _VLLM_SPEC[port] = (spec_draft, held_pct)
         spec_accept_pct = round(held_pct, 1)
+    return spec_accept_pct
+
+
+def fetch_vllm_endpoint(port):
+    """vLLM flavor of fetch_endpoint: same output shape, vllm: metric names.
+
+    vLLM exports cumulative counters (prompt_tokens_total / generation_tokens_total),
+    so PP/TG tok-s are derived from the delta since the previous poll (first
+    poll after a restart reads 0 — settles by the second sample).
+    """
+    metrics = fetch_llama_metrics(port)  # generic Prometheus parse works for vllm: names too
+    props = fetch_vllm_props(port)
+    up = "_error" not in props
+    n_ctx = props.get("n_ctx", 0) if up else 0
+
+    # Parse vLLM metrics into named values
+    parsed = _parse_vllm_metrics(metrics)
+    kv_ratio = parsed["kv_ratio"]
+    prompt_total = parsed["prompt_total"]
+    gen_total = parsed["gen_total"]
+    running = parsed["running"]
+    pf_tok = parsed["pf_tok"]
+    pf_time = parsed["pf_time"]
+    spec_acc = parsed["spec_acc"]
+    spec_draft = parsed["spec_draft"]
+
+    # Update history (handles restart detection, memory bounds)
+    hist, now = _update_vllm_history(port, prompt_total, gen_total, spec_acc, spec_draft)
+
+    # Decode TPS from windowed rate
+    decode_tps = _compute_windowed_rate(hist, now, prompt_total, gen_total, 2, _DECODE_WINDOW_S)
+
+    # Prompt TPS from burst-hold
+    prompt_tps = _compute_prompt_tps(port, pf_tok, pf_time)
+
+    # Spec-decode acceptance %
+    spec_accept_pct = _compute_spec_accept_pct(port, hist, now, spec_acc, spec_draft)
+
     return {
         "status": "up" if up else "down",
         "metrics": metrics,
@@ -475,11 +537,11 @@ def _hosts_names():
     return names
 
 
-def get_lan():
-    now = time.time()
-    if _LAN_CACHE["data"] is not None and now - _LAN_CACHE["t"] < 10:
-        return _LAN_CACHE["data"]
-    names = _hosts_names()
+def _parse_arp_neighbors(names):
+    """Parse `ip -4 neigh show` output into a list of neighbor dicts.
+
+    Filters out skipped interfaces and FAILED entries. Sorted by REACHABLE first.
+    """
     neighbors = []
     try:
         out = subprocess.check_output(["ip", "-4", "neigh", "show"], text=True, timeout=3)
@@ -499,6 +561,15 @@ def get_lan():
     except Exception:
         pass
     neighbors.sort(key=lambda n: (n["state"] != "REACHABLE", n["ip"]))
+    return neighbors
+
+
+def _parse_tcp_peers(names):
+    """Parse `ss -Htn state established` into LAN peers and WAN connection count.
+
+    Returns (peers_list, wan_conns_count). Peers are sorted by connection count desc,
+    with up to 6 service ports each.
+    """
     lan_peers, wan_conns = {}, 0
     try:
         out = subprocess.check_output(["ss", "-Htn", "state", "established"],
@@ -527,6 +598,20 @@ def get_lan():
     peers = sorted(lan_peers.values(), key=lambda p: -p["conns"])
     for p in peers:
         p["ports"] = sorted(p["ports"])[:6]
+    return peers, wan_conns
+
+
+def get_lan():
+    """Gather LAN metadata: ARP neighbors + established TCP connections.
+
+    Cached for 10 seconds so the 2-second dashboard poll stays cheap.
+    """
+    now = time.time()
+    if _LAN_CACHE["data"] is not None and now - _LAN_CACHE["t"] < 10:
+        return _LAN_CACHE["data"]
+    names = _hosts_names()
+    neighbors = _parse_arp_neighbors(names)
+    peers, wan_conns = _parse_tcp_peers(names)
     data = {"neighbors": neighbors, "lan_peers": peers, "wan_conns": wan_conns,
             "reachable": sum(1 for n in neighbors if n["state"] == "REACHABLE"),
             "total_devices": len(neighbors)}
@@ -562,42 +647,49 @@ def get_system():
 class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         if self.path == "/metrics" or self.path == "/api/metrics":
-            payload = self._gather()
-            body = json.dumps(payload, indent=2).encode()
-            self.send_response(200)
-            self.send_header("Content-Type", "application/json")
-            self.send_header("Access-Control-Allow-Origin", "*")
-            self.send_header("Content-Length", str(len(body)))
-            self.end_headers()
-            self.wfile.write(body)
+            self._handle_metrics()
         elif self.path == "/models":
-            # loadable-model registry for the dashboard MODEL LIBRARY (edit models-registry.json)
-            try:
-                reg = os.environ.get("MODELS_REGISTRY",
-                                     os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                                                  "models-registry.json"))
-                body = open(os.path.expanduser(reg), "rb").read()
-                self.send_response(200)
-            except Exception as e:
-                body = json.dumps({"_error": str(e)}).encode()
-                self.send_response(500)
-            self.send_header("Content-Type", "application/json")
-            self.send_header("Access-Control-Allow-Origin", "*")
-            self.send_header("Content-Length", str(len(body)))
-            self.end_headers()
-            self.wfile.write(body)
+            self._handle_models()
         elif self.path == "/health":
-            body = b'{"status":"ok"}'
-            self.send_response(200)
-            self.send_header("Content-Type", "application/json")
-            self.send_header("Access-Control-Allow-Origin", "*")
-            self.end_headers()
-            self.wfile.write(body)
+            self._handle_health()
         else:
-            self.send_response(404)
-            self.send_header("Content-Type", "text/plain")
-            self.end_headers()
-            self.wfile.write(b"404 - use /metrics")
+            self._handle_not_found()
+
+    def _send_json(self, code, body):
+        """Send a JSON response with CORS headers."""
+        self.send_response(code)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _handle_metrics(self):
+        payload = self._gather()
+        body = json.dumps(payload, indent=2).encode()
+        self._send_json(200, body)
+
+    def _handle_models(self):
+        # loadable-model registry for the dashboard MODEL LIBRARY (edit models-registry.json)
+        try:
+            reg = os.environ.get("MODELS_REGISTRY",
+                                 os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                              "models-registry.json"))
+            body = open(os.path.expanduser(reg), "rb").read()
+            self._send_json(200, body)
+        except Exception as e:
+            body = json.dumps({"_error": str(e)}).encode()
+            self._send_json(500, body)
+
+    def _handle_health(self):
+        body = b'{"status":"ok"}'
+        self._send_json(200, body)
+
+    def _handle_not_found(self):
+        self.send_response(404)
+        self.send_header("Content-Type", "text/plain")
+        self.end_headers()
+        self.wfile.write(b"404 - use /metrics")
 
     def _read_thoughts(self, max_bytes=6000):
         """Tail of an optional Thought-Tap log — live reasoning_content (CoT) captured by a
@@ -629,11 +721,8 @@ class Handler(BaseHTTPRequestHandler):
         except Exception:
             return []
 
-    def _gather(self):
-        # Primary worker — keep the llama_8001 key shape, now also carrying
-        # loras + derived fields so the worker panel can show ctx-fill / LoRAs too.
-        worker_port = resolve_worker_port()
-        worker = fetch_endpoint(worker_port)
+    def _gather_dreamers(self):
+        """Fetch snapshots for each secondary (dreamer) server."""
         dreamers = []
         for d in DREAMERS:
             snap = fetch_endpoint(d["port"])
@@ -641,12 +730,19 @@ class Handler(BaseHTTPRequestHandler):
             snap["port"] = d["port"]
             snap["model"] = d["model"]
             dreamers.append(snap)
+        return dreamers
+
+    def _gather(self):
+        # Primary worker — keep the llama_8001 key shape, now also carrying
+        # loras + derived fields so the worker panel can show ctx-fill / LoRAs too.
+        worker_port = resolve_worker_port()
+        worker = fetch_endpoint(worker_port)
         return {
             "timestamp": time.time(),
             "gpus": attach_gpu_procs(parse_nvidia_smi()),
             "worker_port": worker_port,
             "llama_8001": worker,
-            "dreamers": dreamers,
+            "dreamers": self._gather_dreamers(),
             "services": {
                 "llama_8001": check_port("localhost", worker_port),
                 "comfyui_8188": check_port("localhost", 8188),
