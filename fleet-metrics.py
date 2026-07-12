@@ -621,11 +621,10 @@ def _update_lan_peer(ip, names, lan_peers, lport, pport):
     e["ports"].update(_service_ports(lport, pport))
 
 
-def _parse_tcp_peers(names):
-    """Parse `ss -Htn state established` into LAN peers and WAN connection count.
+def _classify_connections(names):
+    """Run ss to classify established connections as LAN peers or WAN.
 
-    Returns (peers_list, wan_conns_count). Peers are sorted by connection count desc,
-    with up to 6 service ports each.
+    Returns (lan_peers_dict, wan_conns_count).
     """
     lan_peers, wan_conns = {}, 0
     try:
@@ -646,6 +645,16 @@ def _parse_tcp_peers(names):
                 wan_conns += 1
     except Exception:
         pass
+    return lan_peers, wan_conns
+
+
+def _parse_tcp_peers(names):
+    """Parse `ss -Htn state established` into LAN peers and WAN connection count.
+
+    Returns (peers_list, wan_conns_count). Peers are sorted by connection count desc,
+    with up to 6 service ports each.
+    """
+    lan_peers, wan_conns = _classify_connections(names)
     peers = sorted(lan_peers.values(), key=lambda p: -p["conns"])
     for p in peers:
         p["ports"] = sorted(p["ports"])[:6]
