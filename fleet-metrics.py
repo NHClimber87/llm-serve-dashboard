@@ -5,9 +5,11 @@ Serves JSON from nvidia-smi + llama.cpp/vLLM /metrics + system stats.
 Runs on :8092. No deps beyond the Python stdlib + nvidia-smi.
 """
 import json
+import math
 import os
 import re
 import subprocess
+import sys
 import time
 import urllib.request
 from http.server import HTTPServer, BaseHTTPRequestHandler
@@ -81,8 +83,52 @@ def _load_secondaries():
     ]
 DREAMERS = _load_secondaries()
 
+def _to_int(s, default=0):
+    """Parse an nvidia-smi field to int, tolerating '[N/A]', '[Not Supported]',
+    'ERR!', blanks, '75.0'-style floats, and non-finite junk ('inf'/'nan'/'1e309').
+    Never raises."""
+    try:
+        v = float(s)
+    except (ValueError, TypeError):
+        return default
+    if not math.isfinite(v):  # 'inf'/'nan' → int() would OverflowError / ValueError
+        return default
+    return int(v)
+
+
+def _to_float(s, default=0.0):
+    """As _to_int but returns a float. Non-finite values collapse to the default so
+    they never reach json.dumps (which would emit Infinity/NaN — invalid JSON that
+    breaks the browser's JSON.parse)."""
+    try:
+        v = float(s)
+    except (ValueError, TypeError):
+        return default
+    return v if math.isfinite(v) else default
+
+
+def _json_safe(obj):
+    """Recursively replace non-finite floats (NaN/Infinity) with None. An upstream
+    server's /props or /metrics can carry these — Python's json.loads accepts them,
+    but json.dumps would then emit bare `NaN`/`Infinity`, which is invalid JSON and
+    makes the browser's resp.json() throw. Sanitizing at the serialization sink means
+    no single bad upstream value can break the whole dashboard."""
+    if isinstance(obj, float):
+        return obj if math.isfinite(obj) else None
+    if isinstance(obj, dict):
+        return {k: _json_safe(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [_json_safe(v) for v in obj]
+    return obj
+
+
 def parse_nvidia_smi():
-    """Query all GPUs and return structured data."""
+    """Query all GPUs and return a list of structured dicts.
+
+    Always returns a list (empty on failure), never a tuple — so a downstream
+    `for gpu of gpus` loop is always safe. Individual unparseable fields (e.g.
+    nvidia-smi emitting '[Not Supported]' or 'ERR!' for power/clocks on some
+    cards) degrade to 0 instead of 500-ing the whole /metrics response."""
     fields = [
         "index", "name", "utilization.gpu", "memory.used", "memory.total",
         "power.draw", "power.limit", "temperature.gpu", "fan.speed",
@@ -94,7 +140,8 @@ def parse_nvidia_smi():
             text=True, timeout=5
         ).strip()
     except Exception as e:
-        return [], str(e)
+        print(f"[fleet-metrics] nvidia-smi query failed: {e}", file=sys.stderr)
+        return []
 
     gpus = []
     for line in out.split("\n"):
@@ -102,17 +149,17 @@ def parse_nvidia_smi():
         if len(parts) < 11:
             continue
         gpus.append({
-            "index": int(parts[0]),
+            "index": _to_int(parts[0]),
             "name": parts[1],
-            "gpu_util": float(parts[2]) if parts[2] != "[N/A]" else 0,
-            "mem_used_mib": int(parts[3]) if parts[3] != "[N/A]" else 0,
-            "mem_total_mib": int(parts[4]) if parts[4] != "[N/A]" else 0,
-            "power_w": float(parts[5]) if parts[5] != "[N/A]" else 0,
-            "power_limit_w": float(parts[6]) if parts[6] != "[N/A]" else 0,
-            "temp_c": int(parts[7]) if parts[7] != "[N/A]" else 0,
-            "fan_pct": int(parts[8]) if parts[8] != "[N/A]" else 0,
-            "sm_clock_mhz": int(parts[9]) if parts[9] != "[N/A]" else 0,
-            "mem_clock_mhz": int(parts[10]) if parts[10] != "[N/A]" else 0,
+            "gpu_util": _to_float(parts[2]),
+            "mem_used_mib": _to_int(parts[3]),
+            "mem_total_mib": _to_int(parts[4]),
+            "power_w": _to_float(parts[5]),
+            "power_limit_w": _to_float(parts[6]),
+            "temp_c": _to_int(parts[7]),
+            "fan_pct": _to_int(parts[8]),
+            "sm_clock_mhz": _to_int(parts[9]),
+            "mem_clock_mhz": _to_int(parts[10]),
         })
     return gpus
 
@@ -120,7 +167,7 @@ def parse_nvidia_smi():
 def attach_gpu_procs(gpus):
     """Annotate each GPU dict with its actual compute tenants (name + VRAM), so the
     dashboard labels cards from ground truth instead of VRAM-threshold guessing."""
-    if not isinstance(gpus, list):  # parse_nvidia_smi error path returns ([], err)
+    if not isinstance(gpus, list):  # defensive: parse_nvidia_smi always returns a list
         return gpus
     try:
         uuid_out = subprocess.check_output(
@@ -154,7 +201,11 @@ def attach_gpu_procs(gpus):
             mem = int(parts[3])
         except ValueError:
             mem = 0
-        procs_by_idx.setdefault(idx, []).append({"name": name, "pid": int(parts[1]), "mem_mib": mem})
+        try:
+            pid = int(parts[1])
+        except ValueError:
+            continue  # skip a record with a non-numeric PID rather than 500 the endpoint
+        procs_by_idx.setdefault(idx, []).append({"name": name, "pid": pid, "mem_mib": mem})
     for g in gpus:
         plist = procs_by_idx.get(g["index"], [])
         g["procs"] = plist
@@ -173,8 +224,12 @@ def parse_prometheus(text):
         m = re.match(r"^([a-zA-Z_:][a-zA-Z0-9_:]*)(?:\{[^}]*\})?\s+([\d.eE+-]+)", line)
         if m:
             name = m.group(1)
-            val = float(m.group(2))
-            metrics[name] = val
+            try:
+                val = float(m.group(2))
+            except ValueError:
+                continue  # a stray '+'/'-'/'.' token — skip this sample, keep the scrape
+            if math.isfinite(val):  # drop +Inf/NaN buckets rather than poison the JSON
+                metrics[name] = val
     return metrics
 
 
@@ -563,7 +618,7 @@ class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         if self.path == "/metrics" or self.path == "/api/metrics":
             payload = self._gather()
-            body = json.dumps(payload, indent=2).encode()
+            body = json.dumps(_json_safe(payload), indent=2, allow_nan=False).encode()
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
             self.send_header("Access-Control-Allow-Origin", "*")

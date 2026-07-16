@@ -75,6 +75,35 @@ cards render with your names.
 llama.cpp exposes Prometheus counters at `/metrics`; the server derives per-second rates from the
 cumulative counters. vLLM's cumulative counters are handled the same way. All parsing is stdlib.
 
+## Python or Rust? Two builds
+
+This repo is the **Python build** — the zero-setup, read-the-whole-thing-in-one-file version. There
+is also a **Rust build, [fleet-tap](https://github.com/NHClimber87/fleet-tap)**, which is a
+transparent traffic *tap* rather than just a metrics scraper. They render the same dashboard; they
+differ in how they get the numbers and what they cost to run.
+
+**Use the Python build (this repo) when:**
+- You want it running in ten seconds: `python3 fleet-metrics.py`, no toolchain, no compile step.
+- You watch one box with one or a handful of servers.
+- You'd rather read and hack a single stdlib file than a Rust crate.
+- You don't want anything sitting in front of your serving ports — this only ever *reads* each
+  server's `/metrics`, never proxies traffic.
+
+**Use the Rust build ([fleet-tap](https://github.com/NHClimber87/fleet-tap)) when:**
+- You want **accurate, client-measured throughput.** It measures real tokens/sec from the actual
+  request/response stream it taps, instead of scraping llama.cpp's `predicted_tokens_seconds` gauge
+  (which reads 0 whenever the model is idle between generations).
+- You run **many endpoints** and want live per-endpoint traffic streaming, **SSE push** (the browser
+  stops polling), and **on-disk retention/history**.
+- You want a single compiled binary with hot-reloadable config (add an endpoint, no restart).
+- You accept the tradeoff: fleet-tap works by **holding each canonical serving port and forwarding
+  to the engine on `port+10000`**, so it's a bit more setup and it sits in the request path (a
+  fleet-tap crash interrupts serving until it restarts). Fine on a box you fully control; more than
+  a casual "just show me the GPUs" tool needs.
+
+Short version: **Python for the quick, side-car glance at one box; Rust for the always-on tap on a
+busy multi-model rig.**
+
 ## Notes
 
 - **Local-first / no phone-home.** No CDNs, no web fonts, no analytics. Everything is served from

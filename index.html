@@ -1538,11 +1538,22 @@ poll();
 setInterval(poll, POLL_INTERVAL);
 
 // ========== MODEL LIBRARY (registry via fleet-metrics /models) ==========
+// Escape any registry-sourced string before it goes into innerHTML. The model
+// library is operator-edited JSON, but a launch flag / model name can legitimately
+// contain <, &, or a quote — without this, that corrupts the DOM (or injects markup).
+function escHtml(s) {
+  return String(s == null ? '' : s).replace(/[&<>"']/g, c => (
+    { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+}
+// The registry convention is `null` = unbenched/absent → hide the row. A real 0 or
+// false IS data (e.g. mtp:false), so show it. Presence = not null/undefined/''.
+const has = v => v !== null && v !== undefined && v !== '';
+const cell = v => has(v) ? escHtml(v) : '';
 async function renderLibrary() {
   const box = document.getElementById('library-cards');
   if (!box) return;
   try {
-    const r = await fetch('http://localhost:8092/models');
+    const r = await fetch('http://localhost:8092/models', { cache: 'no-store' });
     const reg = await r.json();
     box.innerHTML = '';
     for (const m of (reg.models || [])) {
@@ -1553,20 +1564,22 @@ async function renderLibrary() {
       const row = (k, v) => v ? `<div class="metric-sub" style="margin-top:3px;"><span style="color:var(--ink-dim);">${k}</span> ${v}</div>` : '';
       el.innerHTML =
         `<div style="display:flex;justify-content:space-between;align-items:baseline;">
-           <div class="metric-label" style="font-size:13px;color:var(--ink);">${m.name}</div>
-           <span style="font-family:var(--mono);font-size:10px;color:${badge};border:1px solid ${badge};border-radius:4px;padding:1px 6px;">${m.role}</span>
+           <div class="metric-label" style="font-size:13px;color:var(--ink);">${escHtml(m.name)}</div>
+           <span style="font-family:var(--mono);font-size:10px;color:${badge};border:1px solid ${badge};border-radius:4px;padding:1px 6px;">${escHtml(m.role)}</span>
          </div>`
-        + row('tg', m.tg) + row('pp', m.pp)
-        + row('ctx', m.ctx)
-        + row('quant', `${m.quant} · ${m.disk_gb} GB disk`)
-        + row('kv', m.kv) + row('mtp', m.mtp)
-        + row('serve', `${m.engine}${m.port ? ' · :' + m.port : ''}${m.launcher ? ' · ' + m.launcher : ''}`)
-        + row('extras', m.extras)
-        + row('src', `<span style="font-size:10px;color:var(--ink-dim);">${m.src || ''} · asof ${reg.asof}</span>`);
+        + row('tg', cell(m.tg)) + row('pp', cell(m.pp))
+        + row('ctx', cell(m.ctx))
+        + row('quant', [cell(m.quant), has(m.disk_gb) ? escHtml(m.disk_gb) + ' GB disk' : ''].filter(Boolean).join(' · '))
+        + row('kv', cell(m.kv)) + row('mtp', cell(m.mtp))
+        + row('serve', `${escHtml(m.engine)}${has(m.port) ? ' · :' + escHtml(m.port) : ''}${has(m.launcher) ? ' · ' + escHtml(m.launcher) : ''}`)
+        + row('extras', cell(m.extras))
+        + ((has(m.src) || has(reg.asof))
+            ? row('src', `<span style="font-size:10px;color:var(--ink-dim);">${[cell(m.src), has(reg.asof) ? 'asof ' + escHtml(reg.asof) : ''].filter(Boolean).join(' · ')}</span>`)
+            : '');
       box.appendChild(el);
     }
   } catch (e) {
-    box.innerHTML = '<div class="metric-sub">registry unavailable: ' + e + '</div>';
+    box.textContent = 'registry unavailable: ' + e;
   }
 }
 renderLibrary();
