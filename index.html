@@ -804,6 +804,11 @@ section .blurb {
 /* Every number on the page is from the last successful poll once the backend stops answering.
    Fade and desaturate them so stale readings can't be mistaken for live ones; the OFFLINE badge
    itself stays at full strength so the reason is legible. */
+/* GPU collection failed on its own: dim only that section, leave healthy worker/system data
+   at full strength so a box without nvidia-smi still shows everything it does know. */
+body.gpu-unavailable #gpu-cards,
+body.gpu-unavailable #spark-gpu-util { opacity: 0.4; filter: grayscale(0.8); }
+
 body.data-stale .metrics-grid,
 body.data-stale #gpu-cards,
 body.data-stale .sparkline-wrap { opacity: 0.45; filter: grayscale(0.7); transition: opacity .3s; }
@@ -1193,17 +1198,22 @@ function updateMetrics(data) {
   const status = document.getElementById('live-status');
   const poll = document.getElementById('poll-indicator');
 
-  if (!data || !data.gpus || data.gpus.length === 0) {
-    // An empty GPU list means COLLECTION FAILED (nvidia-smi timed out, permissions), not "this
-    // box has no GPUs". The HTTP poll succeeded, so nothing else marks the page stale — every
-    // previous card would keep rendering at full brightness beside the OFFLINE badge, looking
-    // exactly like live data.
+  if (!data) {
     document.body.classList.add('data-stale');
     status.className = 'live-status offline';
-    status.innerHTML = '<span class="dot"></span> OFFLINE — no GPU data in the last payload';
+    status.innerHTML = '<span class="dot"></span> OFFLINE';
     poll.textContent = 'last poll: ' + new Date().toLocaleTimeString();
     return;
   }
+
+  // GPU collection can fail on its own — nvidia-smi missing, timed out, or no permission — while
+  // the worker, RAM and network figures in the SAME payload are perfectly good. An empty list is
+  // therefore "this section is unavailable", not "the dashboard is offline": returning early here
+  // blanked everything on any box without nvidia-smi, including a perfectly healthy llama.cpp.
+  // Degrade the GPU section only, and keep its stale numbers from masquerading as current.
+  const noGpus = !Array.isArray(data.gpus) || data.gpus.length === 0;
+  if (noGpus) data.gpus = [];
+  document.body.classList.toggle('gpu-unavailable', noGpus);
 
   // Real data in hand — safe to present it as current.
   document.body.classList.remove('data-stale');
@@ -1259,9 +1269,13 @@ function updateMetrics(data) {
   // queries. The headline denominator used to be hardcoded to 1200W while this same sum rendered
   // the correct 800W directly beneath it — the two disagreed in the README's own screenshot.
   const powerCap = data.gpus.reduce((s, g) => s + (g.power_limit_w || 0), 0);
-  document.getElementById('metric-power').textContent = fmtNum(totalPower, 0);
-  setEl('metric-power-cap', el => el.textContent = fmtNum(powerCap, 0));
-  document.getElementById('metric-power-sub').textContent = data.gpus.length + ' GPUs · ' + fmtNum(powerCap, 0) + 'W cap';
+  // With no GPU data these sums are 0, and "0 W / 0 W" would read as a measurement rather than
+  // an absence. Say what is actually true.
+  document.getElementById('metric-power').textContent = noGpus ? '—' : fmtNum(totalPower, 0);
+  setEl('metric-power-cap', el => el.textContent = noGpus ? '—' : fmtNum(powerCap, 0));
+  document.getElementById('metric-power-sub').textContent = noGpus
+    ? 'no GPU data — is nvidia-smi present?'
+    : data.gpus.length + ' GPUs · ' + fmtNum(powerCap, 0) + 'W cap';
 
   // Network traffic (fleet-metrics get_network: summed physical NICs, busiest first)
   const net = data.network || { ifaces: [], rx_bps: 0, tx_bps: 0 };
@@ -1340,7 +1354,7 @@ function updateMetrics(data) {
   const observedMaxUtil = allUtil.length ? Math.max(...allUtil) : 0;
   const utilScale = 100;
   setEl('gpu-util-range', el => el.textContent = 'max: ' + Math.round(observedMaxUtil) + '%');
-  setEl('gpu-util-count', el => el.textContent = data.gpus.length + (data.gpus.length === 1 ? ' GPU' : ' GPUs'));
+  setEl('gpu-util-count', el => el.textContent = noGpus ? 'unavailable' : data.gpus.length + (data.gpus.length === 1 ? ' GPU' : ' GPUs'));
   // Draw one sparkline per GPU, stacked on one canvas
   const sparkGpu = document.getElementById('spark-gpu-util');
   const ctxGpu = sparkGpu.getContext('2d');
@@ -1387,16 +1401,10 @@ function updateMetrics(data) {
   document.getElementById('decode-range').textContent = 'max: ' + fmtNum(maxDecode, 1) + ' tok/s';
   drawSparkline(document.getElementById('spark-decode'), history.decodeTps, '#24F094', { max: maxDecode });
 
-  // System
-  if (data.system) {
-    const ramUsed = (data.system.ram_used_mb / 1024).toFixed(1);
-    const ramPct = (data.system.ram_used_mb / data.system.ram_total_mb) * 100;
-    setEl('metric-ram', el => el.textContent = ramUsed);
-    setEl('bar-ram', el => el.style.width = Math.min(ramPct, 100) + '%');
-    setEl('ram-detail', el => el.textContent = ramUsed + ' GiB / ' + (data.system.ram_total_mb / 1024).toFixed(0) + ' GiB (' + ramPct.toFixed(0) + '%)');
-    setEl('metric-load', el => el.textContent = data.system.load_1min.toFixed(2));
-    setEl('metric-load-sub', el => el.textContent = '5m: ' + data.system.load_5min.toFixed(2) + ' · 15m: ' + data.system.load_15min.toFixed(2));
-  }
+  // System (RAM / load): collected by the backend and exposed on /metrics for other consumers,
+  // but this page has no panel for it — the elements these lines targeted (metric-ram, bar-ram,
+  // ram-detail, metric-load, metric-load-sub) do not exist in the markup, so setEl silently did
+  // nothing on every poll. Removed rather than left as decoration; the data is still in the API.
 
   // Services
   if (data.services) {

@@ -33,7 +33,9 @@ chromium --headless --window-size=2880,1640 --virtual-time-budget=9000 \
 - **Secondary servers** — an optional row of cards for extra llama-servers running **on this same
   machine**, each on its own port (a small CPU model, a second engine, etc.). LoRA adapters are
   shown per secondary card. Configure with `SECONDARY_SERVERS`.
-- **System** — RAM, load average, and per-NIC network rates.
+- **Network** — per-NIC rx/tx rates with a session total, plus a passive LAN view (ARP table and
+  established connections; no scanning). RAM and load average are collected and returned on
+  `/metrics` for other consumers, but the page has no panel for them.
 - **Model library** — a browsable inventory of your loadable models with quant, ctx, and measured
   throughput, driven by a JSON registry you edit.
 - **Reasoning tap (optional)** — off by default. Point `THOUGHT_LOG` at a log of streamed

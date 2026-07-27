@@ -93,17 +93,17 @@
       "llamacpp:prompt_tokens_total": 1284736.0,
       "llamacpp:tokens_predicted_total": 356992.0
     },
-    "loras": [],
     "props": {
       "alias": "example-70b-instruct",
       "model_path": "/models/example-70b-instruct.Q4_K_M.gguf",
       "n_ctx": 131072,
       "total_slots": 1,
-      "temperature": 0.7,
-      "top_p": 0.9,
-      "top_k": 40,
-      "min_p": 0.05
+      "temperature": 0.8999999761581421,
+      "top_p": 1.0,
+      "top_k": 0,
+      "min_p": 0.0
     },
+    "loras": [],
     "derived": {
       "prompt_tps": 612.4,
       "decode_tps": 38.7,
@@ -117,26 +117,60 @@
   },
   "secondaries": [
     {
+      "status": "down",
+      "metrics": {
+        "_error": "HTTP Error 502: Bad Gateway"
+      },
+      "props": {
+        "_error": "HTTP Error 502: Bad Gateway"
+      },
+      "loras": [],
+      "derived": {
+        "prompt_tps": 0,
+        "decode_tps": 0,
+        "n_ctx": 0,
+        "ctx_used_tokens": 0,
+        "ctx_fill_pct": 0,
+        "n_loras_active": 0,
+        "n_loras": 0,
+        "requests_processing": 0
+      },
       "name": "cpu-worker-1",
       "port": 9093,
-      "model": "example CPU llama-server",
-      "status": "down"
+      "model": "example CPU llama-server"
     },
     {
+      "status": "down",
+      "metrics": {
+        "_error": "HTTP Error 502: Bad Gateway"
+      },
+      "props": {
+        "_error": "HTTP Error 502: Bad Gateway"
+      },
+      "loras": [],
+      "derived": {
+        "prompt_tps": 0,
+        "decode_tps": 0,
+        "n_ctx": 0,
+        "ctx_used_tokens": 0,
+        "ctx_fill_pct": 0,
+        "n_loras_active": 0,
+        "n_loras": 0,
+        "requests_processing": 0
+      },
       "name": "cpu-worker-2",
       "port": 9095,
-      "model": "example CPU llama-server",
-      "status": "down"
+      "model": "example CPU llama-server"
     }
   ],
   "services": {
     "llama_8001": {
       "status": "up",
-      "code": 200
+      "code": 415
     },
     "comfyui_8188": {
       "status": "down",
-      "code": 0
+      "code": null
     }
   },
   "system": {
@@ -165,14 +199,14 @@
       {
         "ip": "192.0.2.1",
         "name": "router",
-        "mac": "",
+        "mac": "02:00:5e:00:53:01",
         "state": "REACHABLE",
         "dev": "eth0"
       },
       {
         "ip": "192.0.2.42",
         "name": "workstation",
-        "mac": "",
+        "mac": "02:00:5e:00:53:2a",
         "state": "REACHABLE",
         "dev": "eth0"
       }
@@ -192,7 +226,9 @@
     "total_devices": 2
   },
   "thoughts": {
-    "text": ""
+    "text": "",
+    "mtime": 0,
+    "bytes": 0
   },
   "thought_streams": []
 }

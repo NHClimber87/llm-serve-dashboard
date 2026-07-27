@@ -8,6 +8,7 @@ import ipaddress
 import json
 import math
 import os
+import socket
 import re
 import subprocess
 import sys
@@ -66,24 +67,43 @@ _LOOPBACK_HOSTS = {"localhost", "127.0.0.1", "::1", "[::1]"}
 
 
 def _host_only(host_header):
-    """Strip the port from a Host header, handling the bracketed IPv6 form."""
+    """Host header -> bare host, port stripped, IPv6 brackets removed.
+
+    Returns a BRACKETLESS form for both families so comparisons cannot disagree about brackets
+    (`[2001:db8::10]` vs `2001:db8::10` previously compared unequal, rejecting a deliberate
+    IPv6 bind).
+    """
     h = host_header.strip()
-    if h.startswith("["):                       # [::1]:8092
+    if h.startswith("["):                       # [::1]:8092 -> ::1
         end = h.find("]")
-        return h[:end + 1].lower() if end != -1 else h.lower()
+        return (h[1:end] if end != -1 else h.strip("[]")).lower()
+    # A bare IPv6 literal contains many colons; only strip a port from host:port.
+    if h.count(":") > 1:
+        return h.lower()
     return (h.rsplit(":", 1)[0] if ":" in h else h).lower()
 
 
 def host_allowed(host_header):
+    """Allow loopback names, any IP literal, and explicitly configured names.
+
+    DNS rebinding needs a NAME whose resolution can be flipped. An IP literal cannot be rebound:
+    for the attacker's page to be same-origin with `http://<ip>:8092` it must already be served
+    from that address. So literals are safe to accept, and accepting them is what makes the
+    documented LAN workflow work — binding 0.0.0.0 and browsing to the machine's own address used
+    to return 403, i.e. the README described something the guard forbade.
+
+    Names still have to be loopback or named in FLEET_METRICS_ALLOWED_HOSTS.
+    """
     if not host_header:
         return False        # HTTP/1.1 requires Host; absence is not a browser we need to serve
     h = _host_only(host_header)
     if h in _LOOPBACK_HOSTS or h in _ALLOWED_HOSTS:
         return True
-    # Bound deliberately to a specific non-loopback address? Then that literal is expected too.
-    if BIND not in ("127.0.0.1", "localhost", "::1") and h == BIND.strip("[]").lower():
-        return True
-    return False
+    try:
+        ipaddress.ip_address(h)
+        return True                              # an address literal; not rebindable
+    except ValueError:
+        return False                             # a name we were not told to expect
 
 
 # --- scraper transport -------------------------------------------------------------------
@@ -872,6 +892,21 @@ class Handler(BaseHTTPRequestHandler):
             self.send_header("Access-Control-Allow-Origin", allowed)
 
     def do_GET(self):
+        # Reject disallowed cross-origin requests BEFORE doing any work. Refusing only at
+        # response-writing time still ran the full gather — every nvidia-smi call and upstream
+        # scrape — on the single server thread. A hostile page cannot read the JSON, but it could
+        # sit in a loop calling fetch(..., {mode:"no-cors"}) and keep the dashboard busy.
+        origin = self.headers.get("Origin")
+        if (origin and not cors_origin(origin)) or \
+           self.headers.get("Sec-Fetch-Site") == "cross-site":
+            body = b"403 - cross-origin request refused\n"
+            self.send_response(403)
+            self.send_header("Content-Type", "text/plain")
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Vary", "Origin")
+            self.end_headers()
+            self.wfile.write(body)
+            return
         if not host_allowed(self.headers.get("Host")):
             body = (b"403 - unexpected Host header (DNS-rebinding guard).\n"
                     b"Reach this server as localhost/127.0.0.1, or set "
@@ -1023,8 +1058,22 @@ class Handler(BaseHTTPRequestHandler):
         pass  # suppress request logging
 
 
+class _HTTPServerV6(HTTPServer):
+    """HTTPServer is AF_INET only, so FLEET_METRICS_BIND=::1 died with an address-family error."""
+    address_family = socket.AF_INET6
+
+
+def _make_server():
+    try:
+        v6 = isinstance(ipaddress.ip_address(BIND.strip("[]")), ipaddress.IPv6Address)
+    except ValueError:
+        v6 = False              # a name: let getaddrinfo via AF_INET decide, as before
+    cls = _HTTPServerV6 if v6 else HTTPServer
+    return cls((BIND.strip("[]"), PORT), Handler)
+
+
 if __name__ == "__main__":
     print(f"fleet-metrics serving on {BIND}:{PORT}/metrics")
     if BIND not in ("127.0.0.1", "localhost", "::1"):
         print(f"  warning: bound to {BIND} — /metrics is reachable off-box and has no auth")
-    HTTPServer((BIND, PORT), Handler).serve_forever()
+    _make_server().serve_forever()
