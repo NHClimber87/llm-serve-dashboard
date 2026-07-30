@@ -65,6 +65,15 @@ xdg-open http://localhost:8092/
 
 The page polls `/metrics` on its own origin for live data. That's it.
 
+**Port already taken?** `:8092` is a popular port. Move it:
+
+```bash
+FLEET_METRICS_PORT=9100 python3 fleet-metrics.py
+```
+
+The page follows automatically — it polls its own origin, so there is nothing else to change.
+If the port is busy you get a one-line message telling you so, not a traceback.
+
 > Opening `index.html` directly from `file://` no longer works, deliberately. A `file://` page has
 > `Origin: null`, and so does every sandboxed iframe — granting it would let any page that can
 > embed one read your telemetry. Serving the page from the backend makes it same-origin instead.

@@ -2,8 +2,10 @@
 """
 fleet-metrics.py — lightweight metrics endpoint for the LLM serving dashboard.
 Serves JSON from nvidia-smi + llama.cpp/vLLM /metrics + system stats.
-Runs on :8092. No deps beyond the Python stdlib + nvidia-smi.
+Runs on :8092 by default (FLEET_METRICS_PORT to move it). No deps beyond the
+Python stdlib + nvidia-smi.
 """
+import errno
 import ipaddress
 import json
 import math
@@ -16,7 +18,23 @@ import time
 import urllib.request
 from http.server import HTTPServer, BaseHTTPRequestHandler
 
-PORT = 8092
+# 8092 by default, overridable because it is a popular port and a first-run collision is a
+# terrible introduction to a tool:
+#   FLEET_METRICS_PORT=9100 python3 fleet-metrics.py
+def _env_port(name, default):
+    raw = os.environ.get(name)
+    if raw is None or not raw.strip():
+        return default
+    try:
+        port = int(raw)
+    except ValueError:
+        sys.exit(f"fleet-metrics: {name}={raw!r} is not a number")
+    if not 1 <= port <= 65535:
+        sys.exit(f"fleet-metrics: {name}={port} is outside 1-65535")
+    return port
+
+
+PORT = _env_port("FLEET_METRICS_PORT", 8092)
 
 # Loopback by default. /metrics exposes GPU tenants, system stats, ARP neighbours and established
 # connections — that is not something to put on a LAN implicitly. Opt in explicitly if you want it
@@ -1278,7 +1296,24 @@ def _make_server():
 
 
 if __name__ == "__main__":
-    print(f"fleet-metrics serving on {BIND}:{PORT}/metrics")
     if BIND not in ("127.0.0.1", "localhost", "::1"):
         print(f"  warning: bound to {BIND} — /metrics is reachable off-box and has no auth")
-    _make_server().serve_forever()
+    try:
+        server = _make_server()
+    except OSError as e:
+        # A bare traceback here reads as "this software is broken" when the real answer is
+        # "something else already has the port". Say which, and say how to move.
+        if e.errno == errno.EADDRINUSE:
+            sys.exit(
+                f"fleet-metrics: {BIND}:{PORT} is already in use.\n"
+                f"  Something else is on that port — run it elsewhere with:\n"
+                f"    FLEET_METRICS_PORT=9100 python3 fleet-metrics.py"
+            )
+        if e.errno == errno.EACCES:
+            sys.exit(
+                f"fleet-metrics: not permitted to bind {BIND}:{PORT}"
+                + (" (ports below 1024 need root)" if PORT < 1024 else "")
+            )
+        raise
+    print(f"fleet-metrics serving on {BIND}:{PORT}/metrics")
+    server.serve_forever()
