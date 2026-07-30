@@ -53,6 +53,10 @@ chromium --headless --window-size=2880,1640 --virtual-time-budget=9000 \
 
 ## Run it
 
+> **First time here?** [**INSTALL.md**](INSTALL.md) is the two-minute path: start it, confirm
+> it worked, keep it running, and what to do when it doesn't. This section is the short
+> version; the rest of this page is the reference.
+
 Requirements: Python 3.8+ and `nvidia-smi` (NVIDIA GPUs). No pip installs.
 
 ```bash
