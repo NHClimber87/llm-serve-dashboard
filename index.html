@@ -886,6 +886,11 @@ body.data-stale .sparkline-wrap { opacity: 0.45; filter: grayscale(0.7); transit
       <div class="metric-sub" id="metric-decode-sub">predicted tokens: —</div>
     </div>
     <div class="metric-card">
+      <div class="metric-label">Request latency <span id="metric-lat-note" style="color:var(--ink-dim);font-weight:normal;"></span></div>
+      <div class="metric-value"><span id="metric-ttft">—</span><span class="metric-unit">ms TTFT</span></div>
+      <div class="metric-sub" id="metric-lat-sub">waiting for first poll…</div>
+    </div>
+    <div class="metric-card">
       <div class="metric-label">Total GPU power draw</div>
       <div class="metric-value"><span id="metric-power">—</span><span class="metric-unit">W / <span id="metric-power-cap">—</span>W</span></div>
       <div class="metric-sub" id="metric-power-sub">waiting for first poll…</div>
@@ -1163,6 +1168,7 @@ function updateGpuCard(gpu, index) {
     badgeClass = 'idle';
   }
 
+  const linkRow = gpuLinkRow(gpu);
   card.innerHTML = `
     <div class="gpu-header">
       <div>
@@ -1190,8 +1196,77 @@ function updateGpuCard(gpu, index) {
         <span>SM ${gpu.sm_clock_mhz}MHz</span>
         <span>MEM ${gpu.mem_clock_mhz}MHz</span>
       </div>
+      ${linkRow}
     </div>
   `;
+}
+
+// PCIe link + throttle line. Absent on drivers whose field names this nvidia-smi didn't accept
+// (fleet-metrics drops the whole extras group rather than fail the query), so render nothing
+// rather than a row of zeros that reads as "gen0 x0".
+function gpuLinkRow(gpu) {
+  const bits = [];
+  if (typeof gpu.pcie_width === 'number' && gpu.pcie_width > 0) {
+    // Negotiated below the card's own maximum is the interesting case: it is usually the slot,
+    // and on a multi-GPU board it is the difference between a fast card and a mysteriously slow
+    // one that looks identical on every other gauge here. Name only the dimension that is
+    // actually narrowed — spelling out a maximum the card already meets ("x4 of x16 gen3" on a
+    // gen3 card) is noise, and in a four-across grid the extra words wrap the row.
+    const max = [];
+    if (gpu.pcie_width_max > gpu.pcie_width) max.push('x' + gpu.pcie_width_max);
+    if (gpu.pcie_gen_max > gpu.pcie_gen) max.push('gen' + gpu.pcie_gen_max);
+    const link = `GEN${gpu.pcie_gen} x${gpu.pcie_width}`;
+    bits.push(max.length
+      ? `<span style="color:#fbbf24;">LINK ${link}<span style="color:var(--ink-dim);"> of ${max.join(' ')}</span></span>`
+      : `<span>LINK ${link}</span>`);
+  }
+  if (Array.isArray(gpu.throttle) && gpu.throttle.length) {
+    const hot = gpu.throttle.some(r => r.indexOf('thermal') >= 0 || r.indexOf('hw_') === 0);
+    bits.push(`<span style="color:${hot ? '#ef4444' : '#fbbf24'};">THROTTLE ${escHtml(gpu.throttle.join(' '))}</span>`);
+  }
+  if (!bits.length) return '';
+  return `<div style="display:flex;gap:12px;font-family:var(--mono);font-size:11px;color:var(--ink-mute);">${bits.join('')}</div>`;
+}
+
+// Client-visible latency: TTFT, inter-token latency, and queue wait.
+//
+// These come from the engine's own histograms, so what the card can say depends on the engine —
+// and it says which, rather than showing a blank tile that could equally mean "idle" or "broken".
+// llama.cpp exports no latency histogram at all: the honest answer there is that this scraper
+// cannot measure it, not a plausible-looking number derived from aggregate throughput.
+function updateLatencyCard(der, props, status) {
+  const val = document.getElementById('metric-ttft');
+  const sub = document.getElementById('metric-lat-sub');
+  const note = document.getElementById('metric-lat-note');
+  if (!val || !sub) return;
+  const isVllm = props.engine === 'vllm';
+  const has = (x) => typeof x === 'number' && isFinite(x);
+
+  if (status !== 'up') {
+    val.textContent = '—'; sub.textContent = '—'; if (note) note.textContent = '';
+    return;
+  }
+  if (!isVllm && !has(der.ttft_ms)) {
+    val.textContent = '—';
+    if (note) note.textContent = '';
+    sub.textContent = 'llama.cpp exports no latency histogram — needs a tap in the request path';
+    return;
+  }
+  if (!has(der.ttft_ms) && !has(der.itl_ms)) {
+    val.textContent = '—';
+    if (note) note.textContent = '';
+    sub.textContent = 'no requests completed recently';
+    return;
+  }
+  val.textContent = has(der.ttft_ms) ? fmtNum(der.ttft_ms, 0) : '—';
+  const parts = [];
+  if (has(der.itl_ms)) parts.push('ITL ' + fmtNum(der.itl_ms, 1) + 'ms');
+  if (has(der.queue_ms)) parts.push('queue ' + fmtNum(der.queue_ms, 0) + 'ms');
+  // Age of the freshest held component — same honesty rule as the throughput tiles.
+  const ages = [der.ttft_age_s, der.itl_age_s, der.queue_age_s].filter(a => typeof a === 'number' && a > 0);
+  const age = ages.length ? Math.min.apply(null, ages) : 0;
+  sub.textContent = (parts.join(' · ') || 'mean of recent completions') + (age ? ' · ' + fmtAge(age) + ' ago' : '');
+  if (note) note.textContent = age ? '(held)' : '(30s mean)';
 }
 
 function updateMetrics(data) {
@@ -1243,6 +1318,7 @@ function updateMetrics(data) {
   const promptTotal = met['llamacpp:prompt_tokens_total'] || met['vllm:prompt_tokens_total'] || 0;
   const decodeTotal = met['llamacpp:tokens_predicted_total'] || met['vllm:generation_tokens_total'] || 0;
   const reqs = der.requests_processing || met['llamacpp:requests_processing'] || 0;
+  const waiting = der.requests_waiting || 0;
 
   // Seat concurrency and KV fill on the model tile. The fill was collected and rendered for
   // SECONDARY cards but never for the primary, even though the README advertised it — so the
@@ -1250,18 +1326,27 @@ function updateMetrics(data) {
   const msub = document.getElementById('metric-model-sub');
   if (msub && props.n_ctx) {
     msub.textContent += ' · ' + reqs + ' active seat' + (reqs === 1 ? '' : 's');
+    // Queue depth is the saturation signal: seats full is fine, seats full WITH a queue behind
+    // them is the engine being asked for more than it can serve. Only shown when non-zero.
+    if (waiting > 0) msub.textContent += ' · ' + waiting + ' queued';
     const primaryFill = der.ctx_fill_pct;
     if (typeof primaryFill === 'number' && isFinite(primaryFill)) {
       msub.textContent += ' · ' + primaryFill.toFixed(0) + '% full';
     }
   }
 
+  // A held rate is not a current rate. When the backend reports an age, say so on the tile —
+  // "· 4s ago" — so an idle box never reads as one that is generating right now.
+  const heldNote = (age) => (age ? ' · ' + fmtAge(age) + ' ago' : '');
   document.getElementById('metric-prompt-tps').textContent = fmtNum(promptTps, 1);
-  document.getElementById('metric-prompt-sub').textContent = 'prompt tokens: ' + Number(promptTotal).toLocaleString() + ' · reqs: ' + reqs;
+  document.getElementById('metric-prompt-sub').textContent = 'prompt tokens: ' + Number(promptTotal).toLocaleString()
+    + ' · reqs: ' + reqs + heldNote(der.prompt_tps_age_s);
   document.getElementById('metric-decode-tps').textContent = fmtNum(decodeTps, 1);
   const specPct = der.spec_accept_pct;
   document.getElementById('metric-decode-sub').textContent = 'predicted tokens: ' + Number(decodeTotal).toLocaleString()
-    + (specPct != null ? ' · MTP accept: ' + fmtNum(specPct, 0) + '%' : '');
+    + (specPct != null ? ' · MTP accept: ' + fmtNum(specPct, 0) + '%' : '')
+    + heldNote(der.decode_tps_age_s);
+  updateLatencyCard(der, props, data.llama_8001.status);
 
   // Total power
   const totalPower = data.gpus.reduce((s, g) => s + g.power_w, 0);
@@ -1472,6 +1557,12 @@ function renderSecondaries(secondaries) {
     // Prefer the live model name (self-corrects when a sleeve is swapped); strip .gguf.
     const liveAlias = (up && live.props && live.props.alias) ? live.props.alias.replace(/\.gguf$/, '') : '';
     const modelLabel = liveAlias || meta.model;
+    // Requests accepted but waiting for a free slot. A secondary at 100% ctx fill with nothing
+    // queued is healthy; the same card with a queue behind it is the one to go look at.
+    const queued = d.requests_waiting || 0;
+    const queuedBadge = queued > 0
+      ? ` · <span style="color:#fbbf24;">${queued} queued</span>`
+      : '';
 
     // l.name / l.scale come straight from the secondary server's /lora-adapters response.
     // Escape both — and note the title="" is an ATTRIBUTE sink, so it needs escaping too.
@@ -1487,7 +1578,7 @@ function renderSecondaries(secondaries) {
         <span class="dr-name">${escHtml(meta.name)}</span>
         <span class="metric-unit" style="margin-left:auto;">:${escHtml(meta.port)} · ${escHtml(meta.role)}</span>
       </div>
-      <div class="dr-model">${escHtml(modelLabel)}${up ? '' : ' · <span style="color:var(--amber)">DOWN</span>'}</div>
+      <div class="dr-model">${escHtml(modelLabel)}${up ? queuedBadge : ' · <span style="color:var(--amber)">DOWN</span>'}</div>
       <div class="dr-tps">
         <div><div class="v ${up ? '' : 'dim'}">${up ? fmtNum(pp, 1) : '—'}</div><div class="l">PP tok/s</div></div>
         <div><div class="v ${up ? '' : 'dim'}">${up ? fmtNum(tg, 1) : '—'}</div><div class="l">TG tok/s</div></div>

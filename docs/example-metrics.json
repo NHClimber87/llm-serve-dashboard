@@ -13,6 +13,14 @@
       "fan_pct": 30,
       "sm_clock_mhz": 1755,
       "mem_clock_mhz": 9501,
+      "pcie_gen": 4,
+      "pcie_gen_max": 4,
+      "pcie_width": 16,
+      "pcie_width_max": 16,
+      "throttle_mask": 4,
+      "throttle": [
+        "sw_power_cap"
+      ],
       "procs": [
         {
           "name": "llama-server",
@@ -34,6 +42,14 @@
       "fan_pct": 30,
       "sm_clock_mhz": 1755,
       "mem_clock_mhz": 9501,
+      "pcie_gen": 3,
+      "pcie_gen_max": 3,
+      "pcie_width": 1,
+      "pcie_width_max": 16,
+      "throttle_mask": 4,
+      "throttle": [
+        "sw_power_cap"
+      ],
       "procs": [
         {
           "name": "llama-server",
@@ -55,6 +71,12 @@
       "fan_pct": 30,
       "sm_clock_mhz": 1755,
       "mem_clock_mhz": 9501,
+      "pcie_gen": 3,
+      "pcie_gen_max": 3,
+      "pcie_width": 4,
+      "pcie_width_max": 16,
+      "throttle_mask": 0,
+      "throttle": [],
       "procs": [
         {
           "name": "llama-server",
@@ -76,6 +98,12 @@
       "fan_pct": 0,
       "sm_clock_mhz": 210,
       "mem_clock_mhz": 405,
+      "pcie_gen": 4,
+      "pcie_gen_max": 4,
+      "pcie_width": 4,
+      "pcie_width_max": 16,
+      "throttle_mask": 0,
+      "throttle": [],
       "procs": [],
       "tenant": ""
     }
@@ -91,7 +119,8 @@
       "llamacpp:requests_processing": 1.0,
       "llamacpp:requests_deferred": 0.0,
       "llamacpp:prompt_tokens_total": 1284736.0,
-      "llamacpp:tokens_predicted_total": 356992.0
+      "llamacpp:tokens_predicted_total": 356992.0,
+      "llamacpp:n_busy_slots_per_decode": 1.0
     },
     "props": {
       "alias": "example-70b-instruct",
@@ -112,7 +141,17 @@
       "ctx_fill_pct": 36.3,
       "n_loras_active": 0,
       "n_loras": 0,
-      "requests_processing": 1.0
+      "requests_processing": 1.0,
+      "prompt_tps_age_s": 0.0,
+      "decode_tps_age_s": 0.0,
+      "requests_waiting": 0.0,
+      "busy_slots_per_decode": 1.0,
+      "ttft_ms": null,
+      "ttft_age_s": null,
+      "itl_ms": null,
+      "itl_age_s": null,
+      "queue_ms": null,
+      "queue_age_s": null
     }
   },
   "secondaries": [
@@ -133,7 +172,17 @@
         "ctx_fill_pct": 0,
         "n_loras_active": 0,
         "n_loras": 0,
-        "requests_processing": 0
+        "requests_processing": 0,
+        "requests_waiting": 0,
+        "busy_slots_per_decode": null,
+        "prompt_tps_age_s": null,
+        "decode_tps_age_s": null,
+        "ttft_ms": null,
+        "ttft_age_s": null,
+        "itl_ms": null,
+        "itl_age_s": null,
+        "queue_ms": null,
+        "queue_age_s": null
       },
       "name": "cpu-worker-1",
       "port": 9093,
@@ -156,7 +205,17 @@
         "ctx_fill_pct": 0,
         "n_loras_active": 0,
         "n_loras": 0,
-        "requests_processing": 0
+        "requests_processing": 0,
+        "requests_waiting": 0,
+        "busy_slots_per_decode": null,
+        "prompt_tps_age_s": null,
+        "decode_tps_age_s": null,
+        "ttft_ms": null,
+        "ttft_age_s": null,
+        "itl_ms": null,
+        "itl_age_s": null,
+        "queue_ms": null,
+        "queue_age_s": null
       },
       "name": "cpu-worker-2",
       "port": 9095,

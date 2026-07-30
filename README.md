@@ -25,11 +25,20 @@ chromium --headless --window-size=2880,1640 --virtual-time-budget=9000 \
 
 - **GPUs** — per-card utilization, VRAM, power, temperature, clocks, and the actual compute
   tenants on each card (pulled from `nvidia-smi --query-compute-apps`, so cards are labeled from
-  ground truth, not VRAM guesswork).
-- **Primary worker** — decode & prefill tokens/sec, request counts, context/KV fill. Works with
-  llama.cpp (`/metrics` + `/props`) and vLLM (`/metrics` + `/v1/models`). The worker port is
-  **auto-discovered** from listening sockets, so a bench or swap that moves the model to another
-  port still lands on the dashboard.
+  ground truth, not VRAM guesswork). Also the **negotiated PCIe link** and any **active throttle
+  reason**: a card sitting at `GEN3 x1 of x16` or capped at `sw_power_cap` looks perfectly healthy
+  on every other gauge, and is usually the answer to "why is this one card slow?".
+- **Primary worker** — decode & prefill tokens/sec, request counts, queue depth, context/KV fill.
+  Works with llama.cpp (`/metrics` + `/props`) and vLLM (`/metrics` + `/v1/models`). The worker
+  port is **auto-discovered** from listening sockets, so a bench or swap that moves the model to
+  another port still lands on the dashboard.
+- **Request latency** — mean TTFT, inter-token latency and queue wait over the last 30 seconds of
+  completed requests. This one is **vLLM-only**, and the tile says so on llama.cpp rather than
+  going blank: llama.cpp's exporter publishes eleven series and none of them is a latency
+  histogram, so a scraper cannot know what any single client waited. (`1000 / tokens-per-second`
+  would look like inter-token latency, but it is an average across every batched slot, not one
+  client's experience — this dashboard doesn't print it.) Measuring latency under llama.cpp needs
+  something in the request path; see the Rust build below.
 - **Secondary servers** — an optional row of cards for extra llama-servers running **on this same
   machine**, each on its own port (a small CPU model, a second engine, etc.). LoRA adapters are
   shown per secondary card. Configure with `SECONDARY_SERVERS`.
@@ -94,9 +103,20 @@ cards render with your names.
 - `GET /health` — liveness.
 
 llama.cpp publishes ready-made rate gauges (`prompt_tokens_seconds`, `predicted_tokens_seconds`)
-alongside its cumulative counters, and those gauges are read directly — note they read 0 while the
-model is idle between generations. vLLM has no such gauges, so its rates are derived from deltas
-between cumulative counters across polls. All parsing is stdlib.
+alongside its cumulative counters, and those gauges are read directly. vLLM has no such gauges, so
+its rates are derived from deltas between cumulative counters across polls. All parsing is stdlib.
+
+### Held numbers say how old they are
+
+Both engines only report throughput and latency *while they are working*: llama.cpp's rate gauges
+drop to 0 the moment a generation ends, and vLLM's latency histograms simply stop advancing. Both
+failure modes are ugly — a server that answered a request two seconds ago should not read `0.0
+tok/s`, and a burst from an hour ago should not read as the current rate.
+
+So a value with no fresh reading behind it is **held with its age** — the tile shows `38.7 tok/s`
+while live and `38.7 tok/s · 12s ago` once the engine goes quiet — and the hold **expires after 60
+seconds** rather than lingering forever. A server that goes down drops its held values immediately,
+so a restart onto a different model can never inherit the previous model's numbers.
 
 ## Python or Rust? Two builds
 
@@ -113,9 +133,11 @@ differ in how they get the numbers and what they cost to run.
   server's `/metrics`, never proxies traffic.
 
 **Use the Rust build ([fleet-tap](https://github.com/NHClimber87/fleet-tap)) when:**
-- You want **accurate, client-measured throughput.** It measures real tokens/sec from the actual
-  request/response stream it taps, instead of scraping llama.cpp's `predicted_tokens_seconds` gauge
-  (which reads 0 whenever the model is idle between generations).
+- You want **accurate, client-measured throughput and latency.** It measures real tokens/sec, TTFT
+  and inter-token latency from the actual request/response stream it taps. A scraper can only
+  report what the engine chooses to publish: this build holds llama.cpp's idle-zero rate gauges
+  and labels them with an age, but it still cannot produce per-request latency for llama.cpp at
+  all, because llama.cpp exports no latency histogram to scrape.
 - You run **many endpoints** and want live per-endpoint traffic streaming, **SSE push** (the browser
   stops polling), and **on-disk retention/history**.
 - You want a single compiled binary with hot-reloadable config (add an endpoint, no restart).

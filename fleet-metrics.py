@@ -290,6 +290,45 @@ def _json_safe(obj):
     return obj
 
 
+# nvidia-smi's clocks_throttle_reasons.active bitmask, decoded to short labels. GpuIdle (0x1) is
+# deliberately absent: it is a reason the clocks are low, not a reason the card is being held back,
+# and flagging every idle card as "throttled" would train you to ignore the field entirely.
+_THROTTLE_BITS = (
+    (0x0000000000000002, "app_clocks"),
+    (0x0000000000000004, "sw_power_cap"),
+    (0x0000000000000008, "hw_slowdown"),
+    (0x0000000000000010, "sync_boost"),
+    (0x0000000000000020, "sw_thermal"),
+    (0x0000000000000040, "hw_thermal"),
+    (0x0000000000000080, "hw_power_brake"),
+    (0x0000000000000100, "display_clocks"),
+)
+
+# Fields every supported driver has, and the extras added later (PCIe link state + throttle
+# reasons). The extras are queried in the SAME call when supported and dropped wholesale when not:
+# nvidia-smi fails the whole query on one unknown field name, so a driver that renamed
+# clocks_throttle_reasons.* (newer builds prefer clocks_event_reasons.*) would otherwise take the
+# entire GPU panel down with it rather than losing one line of detail.
+_SMI_BASE_FIELDS = [
+    "index", "name", "utilization.gpu", "memory.used", "memory.total",
+    "power.draw", "power.limit", "temperature.gpu", "fan.speed",
+    "clocks.sm", "clocks.mem",
+]
+_SMI_EXTRA_FIELDS = [
+    "pcie.link.gen.current", "pcie.link.gen.max",
+    "pcie.link.width.current", "pcie.link.width.max",
+    "clocks_throttle_reasons.active",
+]
+_SMI_EXTRAS_OK = True   # flipped off for the process lifetime the first time the extras fail
+
+
+def _query_nvidia_smi(fields):
+    return subprocess.check_output(
+        ["nvidia-smi", "--query-gpu=" + ",".join(fields), "--format=csv,noheader,nounits"],
+        text=True, timeout=5
+    ).strip()
+
+
 def parse_nvidia_smi():
     """Query all GPUs and return a list of structured dicts.
 
@@ -297,26 +336,32 @@ def parse_nvidia_smi():
     `for gpu of gpus` loop is always safe. Individual unparseable fields (e.g.
     nvidia-smi emitting '[Not Supported]' or 'ERR!' for power/clocks on some
     cards) degrade to 0 instead of 500-ing the whole /metrics response."""
-    fields = [
-        "index", "name", "utilization.gpu", "memory.used", "memory.total",
-        "power.draw", "power.limit", "temperature.gpu", "fan.speed",
-        "clocks.sm", "clocks.mem"
-    ]
+    global _SMI_EXTRAS_OK
+    fields = _SMI_BASE_FIELDS + (_SMI_EXTRA_FIELDS if _SMI_EXTRAS_OK else [])
     try:
-        out = subprocess.check_output(
-            ["nvidia-smi", "--query-gpu=" + ",".join(fields), "--format=csv,noheader,nounits"],
-            text=True, timeout=5
-        ).strip()
+        out = _query_nvidia_smi(fields)
     except Exception as e:
-        print(f"[fleet-metrics] nvidia-smi query failed: {e}", file=sys.stderr)
-        return []
+        if _SMI_EXTRAS_OK:
+            # Retry once without the optional fields before giving up on the panel.
+            _SMI_EXTRAS_OK = False
+            print(f"[fleet-metrics] nvidia-smi extended query failed ({e}); "
+                  "falling back to base fields (no PCIe link / throttle detail)", file=sys.stderr)
+            fields = _SMI_BASE_FIELDS
+            try:
+                out = _query_nvidia_smi(fields)
+            except Exception as e2:
+                print(f"[fleet-metrics] nvidia-smi query failed: {e2}", file=sys.stderr)
+                return []
+        else:
+            print(f"[fleet-metrics] nvidia-smi query failed: {e}", file=sys.stderr)
+            return []
 
     gpus = []
     for line in out.split("\n"):
         parts = [p.strip() for p in line.split(",")]
-        if len(parts) < 11:
+        if len(parts) < len(_SMI_BASE_FIELDS):
             continue
-        gpus.append({
+        gpu = {
             "index": _to_int(parts[0]),
             "name": parts[1],
             "gpu_util": _to_float(parts[2]),
@@ -328,7 +373,24 @@ def parse_nvidia_smi():
             "fan_pct": _to_int(parts[8]),
             "sm_clock_mhz": _to_int(parts[9]),
             "mem_clock_mhz": _to_int(parts[10]),
-        })
+        }
+        if len(parts) >= len(_SMI_BASE_FIELDS) + len(_SMI_EXTRA_FIELDS):
+            # Link state is what the card NEGOTIATED, not what the slot is wired for, and on a
+            # multi-GPU board the two routinely differ (a card in an x1 slot reads x1 here while
+            # advertising x16 max). That gap is the whole point of showing it: it explains a slow
+            # tensor-parallel card that looks healthy on every other gauge.
+            gpu["pcie_gen"] = _to_int(parts[11])
+            gpu["pcie_gen_max"] = _to_int(parts[12])
+            gpu["pcie_width"] = _to_int(parts[13])
+            gpu["pcie_width_max"] = _to_int(parts[14])
+            raw = parts[15]
+            try:
+                mask = int(raw, 16) if raw.lower().startswith("0x") else int(raw)
+            except ValueError:
+                mask = 0          # '[Not Supported]' / 'ERR!' — no reasons, not a fake zero clock
+            gpu["throttle_mask"] = mask
+            gpu["throttle"] = [name for bit, name in _THROTTLE_BITS if mask & bit]
+        gpus.append(gpu)
     return gpus
 
 
@@ -543,6 +605,48 @@ _PP_HOLD_MAX_S = 60.0     # a held prefill rate with no new burst behind it is s
 # spec-decode acceptance burst-hold: {port: (last_draft_total, held_pct)}
 _VLLM_SPEC = {}
 
+# Generic burst-hold for values that only exist WHILE the engine is working: {(port, key): (v, t)}
+_HOLD = {}
+
+
+def hold_value(port, key, value, now=None):
+    """Hold the last live reading of a bursty value, with its age.
+
+    llama.cpp publishes `prompt_tokens_seconds` / `predicted_tokens_seconds` as instantaneous
+    gauges that read 0 whenever the model is idle between generations, and vLLM's latency
+    histograms stop moving for the same reason. Rendering that as "0 tok/s" or "— ms" makes a
+    box that just answered a request look dead. Rendering the last burst FOREVER is the opposite
+    failure — the one `_PP_HOLD_MAX_S` already exists to prevent — so the hold expires, and until
+    it does the caller gets the age so the page can say *when* the number was true.
+
+    `value` falsy (0 or None) means "no fresh reading this poll". Returns (value, age_s) where
+    age_s is 0.0 while live and None when nothing is being held.
+    """
+    now = now or time.time()
+    k = (port, key)
+    if value:
+        _HOLD[k] = (value, now)
+        return value, 0.0
+    held = _HOLD.get(k)
+    if not held:
+        return (0.0 if value == 0 else None), None
+    age = now - held[1]
+    if age > _PP_HOLD_MAX_S:
+        del _HOLD[k]
+        return (0.0 if value == 0 else None), None
+    return held[0], age
+
+
+def drop_holds(port):
+    """Forget a port's held values — called when it goes down.
+
+    Without this, a server that is restarted onto a different model comes back idle and inherits
+    the PREVIOUS model's throughput and latency numbers, which is the most misleading state the
+    dashboard could possibly be in.
+    """
+    for k in [k for k in _HOLD if k[0] == port]:
+        del _HOLD[k]
+
 
 def fetch_vllm_endpoint(port):
     """vLLM flavor of fetch_endpoint: same output shape, vllm: metric names.
@@ -554,10 +658,20 @@ def fetch_vllm_endpoint(port):
     metrics = fetch_llama_metrics(port)  # generic Prometheus parse works for vllm: names too
     props = fetch_vllm_props(port)
     up = "_error" not in props
+    if not up:
+        drop_holds(port)
     n_ctx = props.get("n_ctx", 0) if up else 0
-    kv_ratio = prompt_total = gen_total = running = 0.0
+    kv_ratio = prompt_total = gen_total = running = waiting = 0.0
     pf_tok = pf_time = 0.0
     spec_acc = spec_draft = None   # spec-decode counters absent unless the server runs MTP/draft
+    # Latency histograms: (Σseconds, #observations) pairs. vLLM is the only one of the two engines
+    # that publishes these at all — see the llama.cpp path for why that half stays empty.
+    lat = {k: [0.0, 0.0] for k in ("ttft", "itl", "queue")}
+    _LAT_SERIES = (
+        ("ttft", "vllm:time_to_first_token_seconds"),
+        ("itl", "vllm:time_per_output_token_seconds"),
+        ("queue", "vllm:request_queue_time_seconds"),
+    )
     if isinstance(metrics, dict):
         for k, v in metrics.items():
             if k.startswith("vllm:kv_cache_usage_perc") or k.startswith("vllm:gpu_cache_usage_perc"):
@@ -568,6 +682,8 @@ def fetch_vllm_endpoint(port):
                 gen_total += v
             elif k.startswith("vllm:num_requests_running"):
                 running += v
+            elif k.startswith("vllm:num_requests_waiting"):
+                waiting += v
             elif k.startswith("vllm:request_prefill_kv_computed_tokens_sum"):
                 pf_tok += v
             elif k.startswith("vllm:request_prefill_time_seconds_sum"):
@@ -576,12 +692,23 @@ def fetch_vllm_endpoint(port):
                 spec_acc = (spec_acc or 0.0) + v
             elif k.startswith("vllm:spec_decode_num_draft_tokens_total"):
                 spec_draft = (spec_draft or 0.0) + v
+            else:
+                for name, prefix in _LAT_SERIES:
+                    # Exact suffix match only. `_bucket` shares the prefix and is a per-`le` count,
+                    # so a prefix match would fold bucket counts into the observation count and
+                    # divide the latency sum by a number several times too large.
+                    if k == prefix + "_sum":
+                        lat[name][0] += v
+                    elif k == prefix + "_count":
+                        lat[name][1] += v
     now = time.time()
     hist = _VLLM_HIST.setdefault(port, [])
     # server restart resets counters -> drop stale history so rates don't go negative-then-zero
     if hist and (prompt_total < hist[-1][1] or gen_total < hist[-1][2]):
         hist.clear()
-    hist.append((now, prompt_total, gen_total, spec_acc or 0.0, spec_draft or 0.0))
+    hist.append((now, prompt_total, gen_total, spec_acc or 0.0, spec_draft or 0.0,
+                 lat["ttft"][0], lat["ttft"][1], lat["itl"][0], lat["itl"][1],
+                 lat["queue"][0], lat["queue"][1]))
     del hist[: max(0, len(hist) - 120)]   # bound memory (~4 min at 2s polls)
 
     def _windowed_rate(idx, window):
@@ -598,6 +725,49 @@ def fetch_vllm_endpoint(port):
         return max(0.0, (cur - ref[idx]) / dt)
 
     decode_tps = _windowed_rate(2, _DECODE_WINDOW_S)
+
+    # Client-visible latency, from the histogram (Σseconds, #observations) pairs.
+    #
+    # Δsum/Δcount over a window is the mean latency of the requests that FINISHED in that window.
+    # The lifetime sum/count is not that — it is every request since the server started, so a box
+    # that was hammered this morning would still show this morning's TTFT tonight. When no request
+    # completed in the window there is no current answer, so the value is held (with its age) and
+    # then expires, rather than being backfilled with a lifetime average dressed up as "now".
+    # The window is much longer than the decode window: completions are sparse events, not a rate.
+    _LAT_WINDOW_S = 30.0
+    _LAT_IDX = {"ttft": (5, 6), "itl": (7, 8), "queue": (9, 10)}
+
+    def _windowed_mean_ms(name):
+        s_idx, c_idx = _LAT_IDX[name]
+        cur_sum, cur_cnt = lat[name]
+        if cur_cnt <= 0:
+            return None
+        ref = None
+        for s in hist:
+            if now - s[0] <= _LAT_WINDOW_S:
+                break
+            ref = s
+        ref = ref or hist[0]
+        d_cnt = cur_cnt - ref[c_idx]
+        d_sum = cur_sum - ref[s_idx]
+        if d_cnt <= 0 or d_sum < 0:
+            return None                       # nothing completed in the window — hold or expire
+        return 1000.0 * d_sum / d_cnt
+
+    latency = {}
+    for _name in ("ttft", "itl", "queue"):
+        # Freshness is "did a request complete since the last poll", NOT "does the window still
+        # contain one". A 30s trailing window keeps yielding a mean for 30s after the last
+        # completion, so keying the age off the window would report "0s ago" half a minute after
+        # the box went quiet — the exact stale-reading-presented-as-current failure this file
+        # keeps guarding against. The mean itself is still the right number to show; only its
+        # age changes. Once nothing has completed for `_PP_HOLD_MAX_S` it expires entirely.
+        _c_idx = _LAT_IDX[_name][1]
+        _advanced = len(hist) >= 2 and hist[-1][_c_idx] > hist[-2][_c_idx]
+        _val, _age = hold_value(port, "lat_" + _name,
+                                _windowed_mean_ms(_name) if _advanced else None, now)
+        latency[_name + "_ms"] = round(_val, 1) if _val else None
+        latency[_name + "_age_s"] = round(_age, 1) if _age is not None else None
 
     # prompt: burst-hold from the prefill-time histogram pair.
     # The hold is bounded. Holding the last burst FOREVER meant one 1,000 tok/s prefill was still
@@ -645,6 +815,10 @@ def fetch_vllm_endpoint(port):
         "derived": {
             "prompt_tps": round(prompt_tps, 1),
             "decode_tps": round(decode_tps, 1),
+            # vLLM's PP/TG are already burst-held above, so they are never a stale-gauge zero the
+            # way llama.cpp's are; the age fields exist so both engines hand the page one shape.
+            "prompt_tps_age_s": None,
+            "decode_tps_age_s": None,
             "spec_accept_pct": spec_accept_pct,
             "n_ctx": n_ctx,
             "ctx_used_tokens": round(kv_ratio * n_ctx),
@@ -652,6 +826,9 @@ def fetch_vllm_endpoint(port):
             "n_loras_active": 0,
             "n_loras": 0,
             "requests_processing": running,
+            "requests_waiting": waiting if up else 0,
+            "busy_slots_per_decode": None,   # llama.cpp-only counter
+            **latency,
         },
     }
 
@@ -670,24 +847,52 @@ def fetch_endpoint(port):
         if "_error" not in fetch_vllm_props(port):
             return fetch_vllm_endpoint(port)
     up = ("_error" not in metrics) or ("_error" not in props)
+    if not up:
+        drop_holds(port)
     loras = fetch_llama_loras(port) if up else []
     active_loras = [l for l in loras if (l.get("scale") or 0) > 0]
     n_ctx = props.get("n_ctx", 0) if isinstance(props, dict) else 0
     kv_ratio = metrics.get("llamacpp:kv_cache_usage_ratio", 0) if isinstance(metrics, dict) else 0
+
+    # llama.cpp's two rate gauges are instantaneous: they read 0 the moment a generation ends, so
+    # the panel used to flip to "0.0 tok/s" between requests on a perfectly healthy server. Hold
+    # the last live reading with its age (bounded, then expires) — the same treatment the vLLM path
+    # already gives its prefill rate. The age is what keeps it honest: "87 tok/s · 4s ago" is a
+    # different claim from "87 tok/s", and only one of them is true on an idle box.
+    pp_raw = metrics.get("llamacpp:prompt_tokens_seconds", 0) if up else 0
+    tg_raw = metrics.get("llamacpp:predicted_tokens_seconds", 0) if up else 0
+    prompt_tps, pp_age = hold_value(port, "pp", pp_raw if up else 0)
+    decode_tps, tg_age = hold_value(port, "tg", tg_raw if up else 0)
     return {
         "status": "up" if up else "down",
         "metrics": metrics,
         "props": props,
         "loras": loras,
         "derived": {
-            "prompt_tps": metrics.get("llamacpp:prompt_tokens_seconds", 0) if up else 0,
-            "decode_tps": metrics.get("llamacpp:predicted_tokens_seconds", 0) if up else 0,
+            "prompt_tps": prompt_tps,
+            "decode_tps": decode_tps,
+            "prompt_tps_age_s": round(pp_age, 1) if pp_age else pp_age,
+            "decode_tps_age_s": round(tg_age, 1) if tg_age else tg_age,
             "n_ctx": n_ctx,
             "ctx_used_tokens": metrics.get("llamacpp:kv_cache_tokens", round(kv_ratio * n_ctx)) if up else 0,
             "ctx_fill_pct": round(kv_ratio * 100, 1) if up else 0,
             "n_loras_active": len(active_loras),
             "n_loras": len(loras),
             "requests_processing": metrics.get("llamacpp:requests_processing", 0) if up else 0,
+            # Deferred = accepted but with no free slot, i.e. the same "queue behind a full
+            # engine" state vLLM calls num_requests_waiting. One key, so the page has one path.
+            "requests_waiting": metrics.get("llamacpp:requests_deferred", 0) if up else 0,
+            # Mean busy slots per decode step: how well the batch is being filled.
+            "busy_slots_per_decode": metrics.get("llamacpp:n_busy_slots_per_decode") if up else None,
+            # llama.cpp's exporter has eleven series and none of them is a latency histogram
+            # (tools/server: prompt/predicted token+seconds totals, n_decode_total, n_tokens_max,
+            # the two rate gauges, requests_processing/deferred, n_busy_slots_per_decode). TTFT
+            # and inter-token latency are therefore NOT derivable from a scrape here — 1000/tok-s
+            # would look like ITL but is an aggregate across every batched slot, not what any one
+            # client waited. Measuring these needs a tap in the request path, not this scraper.
+            "ttft_ms": None, "ttft_age_s": None,
+            "itl_ms": None, "itl_age_s": None,
+            "queue_ms": None, "queue_age_s": None,
         },
     }
 
